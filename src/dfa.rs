@@ -1,10 +1,24 @@
 #![cfg(test)]
 
-use std::{collections::btree_set::Union, io::Write};
+use std::io::Write;
+
+#[test]
+fn test_graphviz() {
+    setup();
+    // let d1 = DfaState::from_str("*f*");
+    // let d2 = DfaState::from_str("f*f*");
+    // let g = graphviz("*f*", "f*f*");
+    // let g = graphviz("*f", "f*q");
+    let g = graphviz("*f", "f*f");
+    // let g = graphviz("*", "*");
+
+    let mut output = std::fs::File::create("./last.dot").unwrap();
+    let _r = output.write_all(g.as_bytes());
+}
 
 #[test]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setup();
+    // setup();
     let sources = vec![
         //  for later
         // ("*?", "*?", Outcome::Equal),
@@ -39,19 +53,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("a*b*z", "a*c*z", Outcome::Intersection),
         ("a", "a*b", Outcome::Disjoint),
     ];
+    let mut wins = 0;
+    let mut losses = 0;
     for (a, b, o) in sources {
         let r = compare(a, b);
-        assert_eq!(o, r, "{a} {b} {r:?}");
+        if o == r {
+            wins += 1;
+        } else {
+            losses += 1;
+            println!("{a} {b} \t\t expected {o:?} got {r:?}");
+        }
     }
+    assert_eq!(losses, 0, "{wins} wins, {losses} losses");
     Ok(())
 }
 
+/// From http://cs.wellesley.edu/~cs235/fall09/lectures/14_DFA_operations/14_DFA_operations_revised.pdf
+/// "To determine if DFA1 and DFA2 are equivalent, construct DFA1 x
+/// DFA2 and examine all state pairs containing at least one accepting
+/// state from DFA1 or DFA2:
+/// • If in all such pairs, both components are accepting, DFA1 and
+/// DFA2 are equivalent --- i.e., they accept the same language.
+/// • If in all such pairs, the first component is accepting but in some
+/// the second is not, the language of DFA1 is a superset of the
+/// language of DFA2 and it is easy to find a string accepted by
+/// DFA1 and not by DFA2
+/// • If in all such pairs, the second component is accepting but in
+/// some the first is not, the language of DFA1 is a subset of the
+/// language of DFA2, and it is easy to find a string accepted by
+/// DFA2 and not by DFA1
+/// • If none of the above cases holds, the languages of DFA1 and
+/// DFA2 are unrelated, and it is easy to find a string accepted by
+/// one and not the other."
+/// ^ The above does not cover intersection.
 #[tracing::instrument(ret)]
 fn compare(s1: &str, s2: &str) -> Outcome {
-    let d1 = DfaState::from_str(s1);
-    let d2 = DfaState::from_str(s2);
+    let d1 = DfaNode::from_str(s1);
+    let d2 = DfaNode::from_str(s2);
     let union = UnionNode::union(Some(&d1), Some(&d2));
-    let ends = visit(&union);
+    let ends = find_terminal_nodes(&union);
     match (
         ends.contains(&TerminalState::L),
         ends.contains(&TerminalState::LR),
@@ -62,18 +102,38 @@ fn compare(s1: &str, s2: &str) -> Outcome {
         (true, false, true) => Outcome::Disjoint,
         (false, true, true) => Outcome::Subset,
         (false, true, false) => Outcome::Equal,
-        _ => unreachable!(),
+        // If we returned every terminal node, only the above cases would ever hit
+        // however, if we exclude certain terminal nodes, we need to handle the below
+        // cases as well.
+        (true, false, false) => Outcome::Superset,
+        (false, false, true) => Outcome::Subset,
+        _ => {
+            println!("{s1} {s2}: {ends:?}");
+            unreachable!()
+        }
     }
 }
 
-fn visit(u: &UnionNode) -> Vec<TerminalState> {
+#[tracing::instrument(skip(u), ret)]
+fn find_terminal_nodes(u: &UnionNode) -> Vec<TerminalState> {
     let mut ret = vec![];
+
+    // if u.terminal != TerminalState::Not {
+    //     ret.push(u.terminal);
+    // }
+
+    // for e in &u.edges {
+    //     if let Edge::Forward(e) = e {
+    //         ret.extend(find_terminal_nodes(&*e.next));
+    //     }
+    // }
+
     if u.edges.is_empty() {
         ret.push(u.terminal);
     } else {
         for e in &u.edges {
             if let Edge::Forward(e) = e {
-                ret.extend(visit(&*e.next));
+                ret.extend(find_terminal_nodes(&*e.next));
             }
         }
     }
@@ -100,10 +160,20 @@ struct UnionNode {
 }
 
 impl UnionNode {
+    #[tracing::instrument(skip(self, l, r))]
+    fn push_edge(&mut self, kind: Element, l: Option<&DfaNode>, r: Option<&DfaNode>) {
+        let edge_node = UnionNode::union(l, r);
+        let edge = Edge::Forward(ForwardEdge {
+            kind,
+            next: Box::new(edge_node),
+        });
+        self.edges.push(edge);
+    }
+
     /// Always produces a new result node, consequently divering paths never rejoin
     /// and the resulting union DFA is not minimal and subtrees are duplicated
-    #[tracing::instrument(ret)]
-    fn union(l: Option<&DfaState>, r: Option<&DfaState>) -> UnionNode {
+    #[tracing::instrument(ret, skip(l, r))]
+    fn union(l: Option<&DfaNode>, r: Option<&DfaNode>) -> UnionNode {
         // takes 1 or 2 dfa nodes, and returns a union node (recur)
         // for each edge in L and R, determine the combination of dfa nodes to attach to it
         // de-duping edges
@@ -125,12 +195,7 @@ impl UnionNode {
                 for r_e in &r_edges {
                     if let Edge::Forward(ForwardEdge { kind, next }) = r_e {
                         // outbound edge
-                        let target = UnionNode::union(None, Some(&*next));
-                        let fe: ForwardEdge<UnionNode> = ForwardEdge {
-                            kind: kind.to_owned(),
-                            next: Box::new(target),
-                        };
-                        ret.edges.push(Edge::Forward(fe));
+                        ret.push_edge(kind.to_owned(), None, Some(&*next));
                     }
                 }
             }
@@ -139,17 +204,11 @@ impl UnionNode {
                 for l_e in &l_edges {
                     if let Edge::Forward(ForwardEdge { kind, next }) = l_e {
                         // outbound edge
-                        let target = UnionNode::union(Some(&*next), None);
-                        let fe: ForwardEdge<UnionNode> = ForwardEdge {
-                            kind: kind.to_owned(),
-                            next: Box::new(target),
-                        };
-                        ret.edges.push(Edge::Forward(fe));
+                        ret.push_edge(kind.to_owned(), Some(&*next), None);
                     }
                 }
             }
             (false, false) => {
-                // complicated
                 // the self loop only matters here for product against the
                 // potential other side forward edge, ignore in the other cases
                 // composite edge type is always the including / most inclusive element
@@ -161,134 +220,65 @@ impl UnionNode {
                                     ElementRelation::Identity => {
                                         // one edge to a union node
                                         // self loops on the union node don't matter for dfa comparison
-                                        let union =
-                                            UnionNode::union(Some(&*lfe.next), Some(&*rfe.next));
-                                        let edge = Edge::Forward(ForwardEdge {
-                                            kind: lfe.kind,
-                                            next: Box::new(union),
-                                        });
-                                        ret.edges.push(edge);
-                                        if lfe.next.self_loop() {
-                                            let keep_l = UnionNode::union(l, Some(&*rfe.next));
-                                            let edge = Edge::Forward(ForwardEdge {
-                                                kind: lfe.kind,
-                                                next: Box::new(keep_l),
-                                            });
-                                            ret.edges.push(edge);
-                                        }
-                                        if rfe.next.self_loop() {
-                                            let keep_r = UnionNode::union(Some(&*lfe.next), r);
-                                            let edge = Edge::Forward(ForwardEdge {
-                                                kind: rfe.kind,
-                                                next: Box::new(keep_r),
-                                            });
-                                            ret.edges.push(edge);
+                                        ret.push_edge(lfe.kind, Some(&*lfe.next), Some(&*rfe.next));
+                                        if lfe.kind != Element::Star {
+                                            if lfe.next.self_loop() {
+                                                ret.push_edge(lfe.kind, l, Some(&*rfe.next));
+                                            }
+                                            if rfe.next.self_loop() {
+                                                ret.push_edge(rfe.kind, Some(&*lfe.next), r);
+                                            }
                                         }
                                     }
                                     ElementRelation::Disjoint => {
                                         // two edges to two discrete nodes
-                                        let l_u = UnionNode::union(Some(&*lfe.next), None);
-                                        let l_edge = Edge::Forward(ForwardEdge {
-                                            kind: lfe.kind,
-                                            next: Box::new(l_u),
-                                        });
-                                        ret.edges.push(l_edge);
-                                        let r_u = UnionNode::union(None, Some(&*rfe.next));
-                                        let r_edge = Edge::Forward(ForwardEdge {
-                                            kind: rfe.kind,
-                                            next: Box::new(r_u),
-                                        });
-                                        ret.edges.push(r_edge);
+                                        ret.push_edge(lfe.kind, Some(&*lfe.next), None);
+                                        ret.push_edge(rfe.kind, None, Some(&*rfe.next));
                                     }
                                     ElementRelation::Subset => {
                                         // two edges,
                                         // one to the union of the two with the kind of the subset,
                                         // one superset edge to the right
                                         // (the one that the subset does not match)
-                                        let union =
-                                            UnionNode::union(Some(&*lfe.next), Some(&*rfe.next));
-                                        ret.edges.push(Edge::Forward(ForwardEdge {
-                                            kind: lfe.kind,
-                                            next: Box::new(union),
-                                        }));
+                                        ret.push_edge(lfe.kind, Some(&*lfe.next), Some(&*rfe.next));
                                         // a star can't fail to match, anywhere there is a self-loop,
                                         // it can continue forever. So do not recur over the possibility
                                         // that it stops.
                                         // if it is a self-loop on the left, do not traverse the right without the left
                                         if rfe.next.self_loop() {
-                                            let l_sup = UnionNode::union(Some(&*lfe.next), r);
-                                            ret.edges.push(Edge::Forward(ForwardEdge {
-                                                kind: lfe.kind,
-                                                next: Box::new(l_sup),
-                                            }));
+                                            ret.push_edge(lfe.kind, Some(&*lfe.next), r);
                                             if !l.as_ref().unwrap().self_loop() {
-                                                let only_star =
-                                                    UnionNode::union(None, Some(&*rfe.next));
-                                                ret.edges.push(Edge::Forward(ForwardEdge {
-                                                    kind: rfe.kind,
-                                                    next: Box::new(only_star),
-                                                }));
+                                                ret.push_edge(rfe.kind, None, Some(&*rfe.next));
                                             }
                                         } else {
-                                            let l_sup = UnionNode::union(Some(&*lfe.next), None);
-                                            ret.edges.push(Edge::Forward(ForwardEdge {
-                                                kind: lfe.kind,
-                                                next: Box::new(l_sup),
-                                            }));
+                                            ret.push_edge(lfe.kind, Some(&*lfe.next), None);
                                         }
                                     }
                                     ElementRelation::Superset => {
                                         // two edges,
                                         // one to the union of the two with the kind of the subset,
                                         // one superset edge to the left
-                                        let union =
-                                            UnionNode::union(Some(&*lfe.next), Some(&rfe.next));
-                                        ret.edges.push(Edge::Forward(ForwardEdge {
-                                            kind: rfe.kind,
-                                            next: Box::new(union),
-                                        }));
+                                        ret.push_edge(rfe.kind, Some(&*lfe.next), Some(&rfe.next));
                                         if lfe.next.self_loop() {
                                             // there is a superset case where the star state does
                                             // not advance.
-                                            let r_sup = UnionNode::union(l, Some(&*rfe.next));
-                                            ret.edges.push(Edge::Forward(ForwardEdge {
-                                                kind: rfe.kind,
-                                                next: Box::new(r_sup),
-                                            }));
+                                            ret.push_edge(rfe.kind, l, Some(&*rfe.next));
                                             if !r.as_ref().unwrap().self_loop() {
-                                                let only_star =
-                                                    UnionNode::union(Some(&*lfe.next), None);
-                                                ret.edges.push(Edge::Forward(ForwardEdge {
-                                                    kind: lfe.kind,
-                                                    next: Box::new(only_star),
-                                                }));
+                                                ret.push_edge(lfe.kind, Some(&*lfe.next), None);
                                             }
                                         } else {
-                                            // println!("OOO {} {}", lfe.next.id, rfe.next.id);
-                                            let r_sup = UnionNode::union(None, Some(&*rfe.next));
-                                            ret.edges.push(Edge::Forward(ForwardEdge {
-                                                kind: rfe.kind,
-                                                next: Box::new(r_sup),
-                                            }));
+                                            ret.push_edge(rfe.kind, None, Some(&*rfe.next));
                                         }
                                     }
                                 }
                             }
                             (Edge::Forward(lfe), Edge::Loop) => {
                                 // one edge to the union of the current R node and lfe.next
-                                let partial = UnionNode::union(Some(&*lfe.next), r);
-                                ret.edges.push(Edge::Forward(ForwardEdge {
-                                    kind: lfe.kind,
-                                    next: Box::new(partial),
-                                }));
+                                ret.push_edge(lfe.kind, Some(&*lfe.next), r);
                             }
                             (Edge::Loop, Edge::Forward(rfe)) => {
                                 // one edge to the union of the current L node and rfe.next
-                                let partial = UnionNode::union(l, Some(&*rfe.next));
-                                ret.edges.push(Edge::Forward(ForwardEdge {
-                                    kind: rfe.kind,
-                                    next: Box::new(partial),
-                                }));
+                                ret.push_edge(rfe.kind, l, Some(&*rfe.next));
                             }
                             // unimportant here, leave unimpl'd
                             (Edge::Loop, Edge::Loop) => (),
@@ -363,8 +353,9 @@ impl std::fmt::Debug for TerminalState {
 }
 
 impl TerminalState {
-    /// Matt is ashamed of this.
-    fn new(d1: &Option<&DfaState>, d2: &Option<&DfaState>) -> Self {
+    // Matt is ashamed of this.
+    #[tracing::instrument(skip(d1, d2), ret)]
+    fn new(d1: &Option<&DfaNode>, d2: &Option<&DfaNode>) -> Self {
         match (
             d1.as_ref().map(|d| d.id).unwrap_or(0),
             d2.as_ref().map(|d| d.id).unwrap_or(0),
@@ -375,28 +366,18 @@ impl TerminalState {
             (_, 1) => TerminalState::R,
             (_, _) => TerminalState::Not,
         }
-        /*
-        match (
-            d1.as_ref().map(|o| o.edges.is_empty()).unwrap_or(false),
-            d2.as_ref().map(|o| o.edges.is_empty()).unwrap_or(false),
-        ) {
-            (true, true) => TerminalState::LR,
-            (true, false) => TerminalState::L,
-            (false, true) => TerminalState::R,
-            (false, false) => TerminalState::Not,
-        }
-        */
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct DfaState {
+struct DfaNode {
     id: usize,
     /// terminal if edges is empty
     edges: Vec<Edge>,
 }
 
-impl DfaState {
+impl DfaNode {
+    /// every node either only proceeds, or proceeds and also self-loops
     fn self_loop(&self) -> bool {
         for e in &self.edges {
             match e {
@@ -437,13 +418,13 @@ impl DfaState {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-enum Edge<S = DfaState> {
+enum Edge<S = DfaNode> {
     Forward(ForwardEdge<S>),
     Loop,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct ForwardEdge<S = DfaState> {
+struct ForwardEdge<S = DfaNode> {
     kind: Element,
     next: Box<S>,
 }
@@ -473,9 +454,6 @@ enum ElementRelation {
 }
 
 impl Element {
-    // treat identity and inclusion as the same relation, as the same work results?
-    // or have a return type enum indicating directionality
-    //TODO ?? or return a reference to the most inclusive element if either includes the other?
     fn relate(&self, other: &Element) -> ElementRelation {
         match (self, other) {
             // each char value is a proceed edge type
@@ -508,23 +486,34 @@ impl From<char> for Element {
     }
 }
 
-impl DfaState {
-    fn from_str(s: &str) -> DfaState {
+#[test]
+fn test_a() {
+    let d1 = DfaNode::from_str("a");
+    assert_eq!(d1.id, 2);
+    let d2 = DfaNode::from_str("a");
+    let union = UnionNode::union(Some(&d1), Some(&d2));
+    let ends = find_terminal_nodes(&union);
+    assert_eq!(ends, vec![TerminalState::LR]);
+}
+
+impl DfaNode {
+    #[tracing::instrument(ret)]
+    fn from_str(s: &str) -> DfaNode {
         let mut id = 0;
         let mut id = || -> usize {
             id += 1;
             id
         };
-        let terminal = DfaState {
+        let terminal = DfaNode {
             id: id(),
             edges: vec![],
         };
         if s.is_empty() {
             terminal
         } else {
-            let mut cursor: Option<DfaState> = Some(terminal);
+            let mut cursor: Option<DfaNode> = Some(terminal);
             // construct the DFA backwards so the next value is always available
-            // and complete, so it can be moved
+            // and complete, so it can be moved.
             // end on the entry node and return it
             for c in s.chars().rev() {
                 if c == '*' {
@@ -538,32 +527,12 @@ impl DfaState {
                     kind: c.into(),
                     next: Box::new(cursor.take().unwrap()),
                 })];
-                let state = DfaState { id: id(), edges };
+                let state = DfaNode { id: id(), edges };
                 cursor.replace(state);
             }
             // cursor now contains the entry state node
             cursor.unwrap()
         }
-    }
-}
-
-#[tracing::instrument(ret)]
-fn compose(a: Outcome, b: Outcome) -> Outcome {
-    match (a, b) {
-        (x, y) if x == y => x,
-
-        (x, Outcome::Disjoint) => x,
-        (Outcome::Disjoint, x) => x,
-
-        (Outcome::Equal, x) => x,
-        (x, Outcome::Equal) => x,
-
-        (Outcome::Subset, Outcome::Superset) => Outcome::Intersection,
-        (Outcome::Superset, Outcome::Subset) => Outcome::Intersection,
-
-        (Outcome::Intersection, _) => Outcome::Intersection,
-        (_, Outcome::Intersection) => Outcome::Intersection,
-        _ => unreachable!(),
     }
 }
 
@@ -574,20 +543,9 @@ fn setup() {
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
-#[test]
-fn test_graphviz() {
-    setup();
-    // let d1 = DfaState::from_str("*f*");
-    // let d2 = DfaState::from_str("f*f*");
-    // let g = graphviz("*f*", "f*f*");
-    let g = graphviz("*f", "f*f");
-    let mut output = std::fs::File::create("./last.dot").unwrap();
-    let _r = output.write_all(g.as_bytes());
-}
-
 fn graphviz(s1: &str, s2: &str) -> String {
-    let d1 = DfaState::from_str(s1);
-    let d2: DfaState = DfaState::from_str(s2);
+    let d1 = DfaNode::from_str(s1);
+    let d2: DfaNode = DfaNode::from_str(s2);
     let union = UnionNode::union(Some(&d1), Some(&d2));
     let label = format!(r#"{s1}\n{s2}"#);
 
